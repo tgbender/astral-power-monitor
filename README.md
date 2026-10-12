@@ -1,0 +1,313 @@
+# Astral Power Monitor for Windows
+
+A native Rust application for Windows that monitors ASUS Astral GPU connector
+current, records per-pin history, sounds alerts, and offers manually armed GPU
+limiting and power-off protection. It runs from a single compiled executable.
+
+This is a standalone project developed from two useful starting points:
+
+- [Timic3/astral-power-monitoring](https://github.com/Timic3/astral-power-monitoring)
+  supplied the original Rust NVAPI/I2C sensor reader and per-pin data format.
+  The starting revision was `6ae55e6bce2af9c1572f260ee99f07bca3b6a351`.
+- [humza-khalid/12vhpwr-guard](https://github.com/humza-khalid/12vhpwr-guard)
+  supplied the Python guard's tiered response behavior, thresholds, timing,
+  hysteresis, and GPU mitigation/recovery approach, reimplemented here in Rust.
+
+The native dashboard and tray integration, SQLite history, independent monitoring
+watchdog, synthesized sounds, icon artwork, custom title bar, and installation
+scripts were added in this project. There is no Python runtime dependency.
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution and licenses.
+
+## What it does
+
+- Displays current, voltage, calculated power, and session peak current for all six power pins.
+- Shows total connector power and the highest pin current.
+- Samples twice per second on a worker thread, independently of the window.
+- Marks readings unavailable after a read failure or three seconds without a fresh sample.
+- Reconnects every five seconds after sensor/driver failures.
+- Displays a warning at 9.2 A; this is a display warning, not an automatic intervention.
+- Records every successful half-second sample in `%LOCALAPPDATA%\AstralPowerMonitor\readings.sqlite`.
+- Records startup and sensor connection/unavailability events alongside samples.
+- Batches ordinary samples into SQLite transactions once per minute; warning/current and lifecycle events commit sooner.
+- Prunes database records older than 24 hours on startup and every ten minutes.
+- Imports the last day's legacy JSONL once, ignoring malformed/incomplete lines. Original CSV and JSONL files are preserved.
+- Allows only one GUI instance per Windows session.
+- Uses a teal GPU tray/taskbar icon with six gold contacts; warnings use an amber exclamation version.
+- Provides manually armed GPU limiting and Windows power-off protection using the Python guard's default ladder.
+- Plays embedded audio warnings even while protection is disarmed. Audio playback runs separately from sensor reads and protective actions.
+- An independent freshness watchdog sounds once if valid pin readings stop, and confirms stable recovery.
+
+**Every launch starts disarmed.** Until you explicitly arm protection, the app reads
+sensors without changing the GPU or shutting Windows down. Current readings are not connector
+temperature measurements or a guarantee against connector damage.
+
+## Using the app
+
+Launch `AstralPowerMonitor.exe`.
+The window uses a dark custom title bar matching the monitor, with the GPU icon and
+keyboard-accessible minimize/hide buttons. Drag the header to move the window;
+close or Alt+F4 hides it to the tray while monitoring continues. Quit remains in the tray menu.
+Closing the window hides it while monitoring continues. Click the tray icon to show it.
+Right-click the tray icon or the readings window for Show readings, Open SQLite history folder,
+Flush buffered history now,
+Reset session peaks, Arm protection, Disarm / Cancel, Restore saved GPU settings,
+Test all sounds, Test monitoring-loss / recovery sounds, Mute warning chime, and Quit.
+Launching it again restores the existing window.
+
+Use `--tray` to start with the window hidden. Launching the executable alone does not
+install startup entries. The optional installation below creates a shortcut for this user.
+Use `--monitor-only` to prohibit arming for the entire session; launching with this flag
+also disarms an existing instance when Windows permits messaging that instance.
+
+## Sound alerts
+
+The original WAVs are embedded in the executable; no external sound files or Python
+runtime are needed. Playback uses asynchronous Windows audio on a dedicated thread.
+Audio errors appear in the window and never stop sampling or delay protective actions.
+
+- At least 9.5 A continuously for two seconds: ascending warning chime, once per episode.
+- At least 13 A: critical triple tone immediately, once per episode. This early sound
+  does not change the original three-second protection timer.
+- GPU limiting successfully activates: descending intervention chime.
+- Windows accepts a shutdown request: alternating countdown alarm for up to five seconds.
+  It stops when disarmed/cancelled, when the app quits, or when its timer expires.
+
+Warning episodes re-arm after fresh current below 9.3 A for one second. Sensor errors
+and gaps cannot count toward the sustained warning or clear an existing warning episode.
+Higher-priority alerts interrupt lower-priority sounds; intervention waits for a playing
+critical tone, while a shutdown alarm supersedes both. Nothing beeps every sensor poll.
+
+**Mute warning chime** only mutes the early 9.5 A chime. Critical, intervention, and
+shutdown tones remain audible, as do monitoring-loss and recovery tones. Mute is not saved across app launches. **Test all
+sounds** plays one preview of each and never arms protection, changes GPU settings,
+or schedules a shutdown. Test audio cannot replace an active real alert. Windows volume
+and the selected output device still determine whether any sound can be heard.
+
+### Monitoring loss
+
+A separate watchdog checks a tiny in-memory sensor heartbeat twice per second; it
+does not issue additional GPU reads and does not depend on the sensor worker or GUI
+making progress. After at least one valid sample, no fresh valid reading for more
+than three seconds triggers a low descending triple tone, once per outage. The
+initial connection has a ten-second grace period so ordinary startup remains quiet.
+
+Recovery requires at least one second of healthy freshness and additional successful
+readings; a single good sample followed by another failure cannot announce recovery.
+A short ascending confirmation sounds on recovery, and a later outage can alert again.
+SQLite `monitoring` events record `lost`/`recovered`, sample count, and last-sample age.
+Existing sensor-error events continue to record the underlying driver/read failures.
+
+Missing data only alerts: the watchdog never changes GPU settings or requests Windows
+shutdown, and an existing emergency limit remains governed by the protection engine.
+The shutdown countdown and critical-current sounds have priority over monitoring sounds.
+Normal application exit stops the watchdog before closing audio/history.
+
+The **Test monitoring-loss / recovery sounds** menu item, or
+`AstralPowerMonitor.exe --test-monitoring-alerts`, previews both sounds in the running
+app without pausing sampling, manufacturing an outage, or invoking protective actions.
+The watchdog runs inside this process: it cannot alert if the entire app exits/crashes,
+Windows freezes completely, or the audio output is unavailable.
+
+## Start at Windows login
+
+After copying the release build to `dist\AstralPowerMonitor.exe`, quit the current
+monitor and run `scripts\Install-Startup.ps1`. This copies the executable to
+`%LOCALAPPDATA%\AstralPowerMonitor\AstralPowerMonitor.exe` and creates
+`Astral Power Monitor.lnk` in this user's Windows Startup folder, targeting `--tray`.
+It also creates a desktop shortcut that opens the monitor window. Both shortcuts use
+the embedded GPU icon from that installed executable. Run the installer from ordinary
+Windows PowerShell: it refuses AppData redirection into a packaged application's
+private folder, which would split history between packaged launches and Windows login.
+It does not install a service, scheduled task, restart policy, or automatic arming.
+The installation is specific to the current user and uses their ordinary login privileges.
+Every login starts with protection disarmed and sound warnings enabled.
+
+To enable GPU limiting, quit that ordinary instance and run the installed executable
+as administrator before manually arming. To disable startup, run
+`scripts\Remove-Startup.ps1` or remove the named startup shortcut. The removal script
+verifies its target and preserves the executable, history, and recovery files.
+
+## Protection (manual arming)
+
+Run as administrator to permit NVIDIA clock/power changes, then choose **Arm protection
+for this session** and confirm. Arming is never saved, enabled by a command-line flag,
+or enabled automatically after a restart. Ordinary monitoring needs no administrator access.
+
+The highest current across all six valid pins drives the original Python defaults:
+
+| Trigger | First response | Power-off escalation |
+| --- | --- | --- |
+| At least 9.5 A for 15 s | Lock GPU clocks low and set the driver-reported minimum power limit | Current remains at least 9.5 A after 10 s |
+| At least 13 A for 3 s | Same GPU limiting | Current remains at least 9.5 A after 5 s |
+| At least 16 A on two consecutive readings | Attempt GPU limiting | Request power-off immediately |
+
+The grace period belongs to the first mitigation; later crossings do not restart it,
+matching Python. A successful clock lock or power-cap change counts as mitigation,
+even if the other change fails. If both fail or NVML cannot control the matching card,
+the triggering tier requests power-off directly, also matching Python. Driver write
+permissions cannot be proved with the read-only readiness check: a non-elevated session
+may fall back to power-off at the trigger instead of limiting first.
+
+On this 5090, the driver reports a 400 W minimum. Clocks use the lowest enumerated
+graphics frequency, falling back to 500, 700, then 1000 MHz if necessary. The previous
+power cap is saved; restoration does not assume 600 W. The app resets its GPU clock
+lock on restoration rather than preserving a pre-existing manual clock lock. Avoid
+having another utility change these settings while protection is engaged.
+
+Limits remain for at least 120 s and are automatically restored only after 60 s of
+readings strictly below 9.3 A and a cleared grace period. A tier that re-triggers within
+600 s of that automatic release attempts limiting and requests power-off directly.
+Tier 1 uses the Python 0.2 A hysteresis and one-second clear window. Read failures
+or gaps longer than five seconds reset observation timers without releasing an
+existing GPU limit; missing readings never satisfy the clean-release window.
+
+Power-off invokes System32 `shutdown.exe /s /t 5 /f`, **not restart**. It forces apps
+closed after five seconds, which can discard unsaved work. A rejected request is
+logged while sampling continues; the next qualifying sample retries. An accepted
+request is latched to avoid repeated requests during its countdown.
+
+**Escape hatches:**
+
+- **Disarm / Cancel pending power-off** disables actions immediately and attempts to
+  abort this app's pending countdown independently of the sensor thread. Cancellation
+  can only work before the five-second countdown expires. Emergency GPU limits stay
+  in place until you choose **Restore saved GPU settings (disarms)**.
+- **Quit** disarms and attempts to cancel a pending app shutdown. Closing the window
+  only hides it. Quitting deliberately retains emergency GPU limits for later restoration.
+- `AstralPowerMonitor.exe --cancel-shutdown` directly aborts a pending Windows shutdown
+  even if the GUI is hung. This aborts any Windows shutdown countdown, not just this app's.
+  Windows may require an elevated terminal to abort an elevated request.
+- `--monitor-only` disables arming; when targeting an already elevated instance, run
+  it with matching privileges or use that instance's tray menu. If Windows blocks the
+  message, the launch reports failure instead of claiming the existing app is disarmed.
+
+Recovery intent and the original cap are flushed to
+`%LOCALAPPDATA%\AstralPowerMonitor\mitigation.json` before driver writes. After a crash,
+the app remains disarmed and requires manual restoration before arming again. Failed
+restoration retains the marker for retry; successful individual changes are tracked so
+retries only restore remaining changes. GPU UUID and power bounds are checked before
+restoring. `last_shutdown.json` retains the last protective shutdown request and reason.
+Neither recovery file causes automatic arming or automatic GPU writes on startup.
+
+For a bounded console snapshot in PowerShell:
+
+```powershell
+& .\target\release\AstralPowerMonitor.exe --once | Out-String
+& .\target\release\AstralPowerMonitor.exe --samples 3 | Out-String
+```
+
+## Build and validate
+
+Requires x64 Windows 10/11, Rust 1.88 or later, the MSVC toolchain/Windows SDK,
+including `rc.exe` on PATH for embedding application icons,
+and an installed NVIDIA driver. Python and HWiNFO are not required. Administrator access
+is needed for GPU limiting, not read-only monitoring.
+
+```powershell
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --release --locked
+```
+
+The executable is `target\release\AstralPowerMonitor.exe`. To prepare the optional
+startup installer after building:
+
+```powershell
+New-Item -ItemType Directory -Path dist -Force | Out-Null
+Copy-Item -LiteralPath target\release\AstralPowerMonitor.exe -Destination dist\AstralPowerMonitor.exe -Force
+```
+
+The native interface uses Windows controls and GDI. The compiled executable, including
+the embedded sounds, icon resources, and SQLite, is roughly 3.2 MiB. Sensor access uses NVIDIA's installed NVAPI driver library; GPU limiting uses
+NVML loaded exclusively from System32. Control selection requires one unambiguous match
+to the monitored card's subsystem ID, with UUID checks for saved-state restoration.
+
+The tests do not access GPU hardware. They cover pin ordering and units, malformed packets,
+high-current readings, stale/disconnected state, card selection, the native request layout,
+SQLite batching, retention, legacy import, transactional failure/retry, bounded logging queues,
+every protection tier, grace periods, release/re-trigger,
+failed actions, recovery markers, disarm/cancel races, audio thresholds, priority,
+muting, countdown cancellation, playback failures, independent monitoring-loss detection,
+startup grace, and stable recovery. Protection/audio tests use fake actions
+and never shut down Windows or change the real GPU. Live hardware validation is a separate
+`--once` check; `--check-control` queries NVML without changing settings. Actual driver
+writes and Windows shutdown have not been exercised on the live machine during development.
+
+## SQLite history and querying
+
+The app embeds SQLite; no external DLL, service, Python runtime, or SQLite executable
+is needed. A dedicated writer collects every successful 500 ms sensor sample and
+normally commits a batch once every 60 s. Samples retain their measurement timestamp,
+not the time of the later commit. WAL mode allows independent read-only queries while
+monitoring continues. `synchronous=FULL` syncs each completed transaction; memory that
+has not yet been committed can still be lost in a hard crash or power cut.
+
+At the visual warning level (any pin at least 9.2 A), entering the warning area requests
+an immediate commit and continued warnings commit about once a second. Critical
+samples at least 13 A request a commit on each poll. Events also request early commits.
+These are logging rules; GPU limiting/shutdown still use the original protection ladder.
+No connector temperature sensor is available: warning flushing is based on current.
+
+An accepted quit stops sampling, drains pending history, and waits up to one second
+for the writer. `--quit` requests that graceful exit from another process without any
+mouse/keyboard input. Windows session-end messages also request bounded flushes.
+Before the app requests its own protective power-off, it records the reason and waits
+at most 200 ms for history; storage failure/timeout cannot prevent shutdown. Sudden
+power cuts, hard resets, or forced process termination provide no flush opportunity:
+up to one minute of normal readings may be lost. Slow/failed storage can lose more.
+
+On startup and every ten minutes, records with timestamps strictly older than 24 h
+are deleted. Free pages are reused and reclaimed incrementally; the whole database
+is not rewritten every minute. Long-running external read transactions can delay WAL
+checkpointing, so close queries when finished. Preserve the `.sqlite`, `-wal`, and
+`-shm` files together while the app is running; a commit can be durable in the WAL
+without yet being copied into the main database file.
+
+The writer retries storage errors every ten seconds. Its queue and memory buffer are
+bounded to 2,048 records each. Overflow drops records (oldest buffered samples first),
+and the window reports errors and a persistent dropped-record count for the session.
+Sampling, sound alerts, and protective decisions continue independently of disk writes.
+
+Tables/views:
+
+- `samples`: `id`, `unix_time_ms` (UTC milliseconds), `gpu`, `connector_watts`,
+  `max_pin_amps`, and `p1_volts`/`p1_amps` through `p6_volts`/`p6_amps`.
+- `pin_readings`: a view with six rows per sample: `sample_id`, `unix_time_ms`,
+  `gpu`, `pin`, `volts`, `amps`, and calculated `watts`.
+- `events`: UTC timestamp, `type`, optional `action`, and structured `details_json`.
+- `metadata`: migration/import bookkeeping. Schema identity uses SQLite application
+  ID `0x41504d31` and `user_version=1`.
+
+The first open imports recent valid records from `readings.jsonl` and its three archives
+in one transaction, recording completion so subsequent starts do not duplicate history.
+Existing legacy files are left untouched and are outside the database's retention policy.
+
+[queries/history.sql](queries/history.sql) contains read-only examples for recent
+power/current, pin 5 vs pin 6, per-pin peaks, warnings, and events. With an optional
+SQLite CLI installed, from the repository root:
+
+```powershell
+sqlite3 -readonly "$env:LOCALAPPDATA\AstralPowerMonitor\readings.sqlite" ".read queries/history.sql"
+```
+
+Ordinary recent readings may still be buffered; choose **Flush buffered history now**
+from the tray menu before querying if you need the latest samples.
+
+## Sensor protocol and supported cards
+
+The IT8915FN sensor is read through `NvAPI_I2CReadEx`, address `0x2B`, register `0x80`,
+port 1. The 24-byte response contains six reversed blocks of big-endian millivolts
+and milliamps. Pin 1 is at bytes 20–23 and Pin 6 at bytes 0–3.
+
+The reader selects the first supported ASUS subsystem ID rather than assuming GPU 0.
+Supported IDs include the Astral 5090 OC, OC White, LC, 5090D OC, Matrix 5090,
+and the listed Astral 5080 variants. The OC White model was checked on real hardware.
+BTF models are excluded because slot power can bypass their cable sensors.
+No I2C write function is bound.
+
+## License
+
+The project's own code and assets, and the original Rust sensor-reader base, are
+released under the [Unlicense](LICENSE). The Python-derived protection behavior
+retains the upstream [MIT notice](LICENSE-12VHPWR-GUARD). Third-party Rust
+dependencies retain their respective licenses.
